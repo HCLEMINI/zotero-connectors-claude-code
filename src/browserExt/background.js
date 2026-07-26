@@ -1174,6 +1174,113 @@ Zotero.Connector_Browser = new function() {
 			return Zotero.Messaging.sendMessage("saveAsWebpage", tab.title, tab);
 		}
 	}
+
+	// Claude Bridge: capture the active tab (or a given tabId) through the
+	// existing translator/save pipeline in silent mode, returning a structured
+	// CaptureResult. Requires the Zotero desktop client to be online.
+	this.captureActiveTab = async function(tabId) {
+		let tab;
+		if (tabId === undefined) {
+			let [activeTab] = await browser.tabs.query({ active: true, currentWindow: true });
+			if (!activeTab) {
+				return { success: false, errorType: 'unknown', error: 'No active tab', items: [] };
+			}
+			tabId = activeTab.id;
+			tab = activeTab;
+		}
+		else {
+			try {
+				tab = await browser.tabs.get(tabId);
+			}
+			catch (e) {
+				return { success: false, errorType: 'unknown', error: 'No tab with id: ' + tabId, items: [] };
+			}
+		}
+		const isOnline = await Zotero.Connector.checkIsOnline();
+		if (!isOnline) {
+			return {
+				success: false,
+				errorType: 'zotero_offline',
+				error: 'Zotero desktop client not running (127.0.0.1:23119 unreachable)',
+				items: []
+			};
+		}
+		const tabInfo = Zotero.Connector_Browser.getTabInfo(tabId);
+		try {
+			let result;
+			if (tabInfo.translators && tabInfo.translators.length) {
+				result = await Zotero.Connector_Browser.saveWithTranslator(tab, 0,
+					{ fallbackOnFailure: true, silent: true });
+			}
+			else if (tabInfo.isPDF) {
+				result = await Zotero.Connector_Browser.saveAsWebpage(tab, tabInfo.frameId,
+					{ snapshot: true, silent: true });
+			}
+			else {
+				result = await Zotero.Connector_Browser.saveAsWebpage(tab, 0,
+					{ snapshot: false, silent: true });
+			}
+			// saveWithTranslator returns onTranslate's CaptureResult (silent mode).
+			// saveAsWebpage may return other shapes; normalize into the schema.
+			if (result && typeof result === 'object' && 'success' in result) return result;
+			return { success: true, items: [], error: null, errorType: null, raw: result };
+		}
+		catch (e) {
+			return {
+				success: false,
+				errorType: (e && e.errorType) || 'unknown',
+				error: (e && e.message) || String(e),
+				items: []
+			};
+		}
+	};
+
+	// Claude Bridge: open a URL in a background tab, wait for load + translator
+	// detection, then capture it via captureActiveTab. Closes the tab afterwards.
+	this.captureUrl = async function(url, options={}) {
+		const closeAfter = options.closeAfter !== false;
+		const loadTimeoutMs = options.loadTimeoutMs || 30000;
+		const detectTimeoutMs = options.detectTimeoutMs || 30000;
+		const isOnline = await Zotero.Connector.checkIsOnline();
+		if (!isOnline) {
+			return {
+				success: false,
+				errorType: 'zotero_offline',
+				error: 'Zotero desktop client not running (127.0.0.1:23119 unreachable)',
+				url, items: []
+			};
+		}
+		Zotero.Connector_Browser.setKeepServiceWorkerAlive(true);
+		let tabId;
+		try {
+			const tab = await browser.tabs.create({ url, active: false });
+			tabId = tab.id;
+			await _waitForTabStatus(tabId, 'complete', loadTimeoutMs);
+			const tabInfo = await _waitForTranslators(tabId, detectTimeoutMs);
+			if (!tabInfo.translators || !tabInfo.translators.length) {
+				return {
+					success: false,
+					errorType: 'no_translator',
+					error: `No translator detected for ${url}`,
+					url, items: []
+				};
+			}
+			const result = await Zotero.Connector_Browser.captureActiveTab(tabId);
+			if (result && url) result.url = result.url || url;
+			return result;
+		}
+		catch (e) {
+			const msg = (e && e.message) || String(e);
+			const errorType = /timeout/i.test(msg) ? 'timeout' : 'unknown';
+			return { success: false, errorType, error: msg, url, items: [] };
+		}
+		finally {
+			if (closeAfter && tabId !== undefined) {
+				try { await browser.tabs.remove(tabId); } catch (e) {}
+			}
+			Zotero.Connector_Browser.setKeepServiceWorkerAlive(false);
+		}
+	};
 	
 	function _getTranslatorLabel(translator) {
 		var translatorName = translator.label;
@@ -1220,6 +1327,38 @@ Zotero.Connector_Browser = new function() {
 			await Zotero.initDeferred.promise;
 			return fn.apply(this, arguments);
 		}
+	}
+
+	// Claude Bridge helpers: wait for a tab to reach a given status, and wait
+	// for translator detection to populate tabInfo.translators. Both poll on a
+	// short interval and reject with 'timeout' / 'No tab' on failure.
+	async function _waitForTabStatus(tabId, targetStatus, timeoutMs) {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			try {
+				const tab = await browser.tabs.get(tabId);
+				if (tab.status === targetStatus) return tab;
+			}
+			catch (e) {
+				throw new Error('No tab with id: ' + tabId);
+			}
+			await new Promise(r => setTimeout(r, 300));
+		}
+		throw new Error('timeout waiting for tab ' + targetStatus);
+	}
+
+	async function _waitForTranslators(tabId, timeoutMs) {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			const tabInfo = Zotero.Connector_Browser.getTabInfo(tabId);
+			// translators === null/undefined means detection has not run yet;
+			// an array (possibly empty) means detection completed.
+			if (tabInfo && tabInfo.translators !== null && tabInfo.translators !== undefined) {
+				return tabInfo;
+			}
+			await new Promise(r => setTimeout(r, 300));
+		}
+		throw new Error('timeout waiting for translators');
 	}
 	
 	async function onNavigation(details, historyChange=false) {

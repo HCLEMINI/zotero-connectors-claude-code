@@ -51,10 +51,49 @@ function determineAttachmentType(attachment) {
 /**
  * Namespace for page saving related functions injected into pages by the connector
  */
+// Format the result of a silent (Claude Bridge) capture into the structured
+// CaptureResult schema consumed by the bridge. Items keep their full metadata
+// fields plus the Zotero-assigned key (present after saveItems resolves).
+function _formatCaptureResult(items, error=null) {
+	if (error) {
+		const msg = (error && error.message) ? error.message : String(error);
+		return {
+			success: false,
+			items: [],
+			error: msg,
+			errorType: (error && error.errorType) ? error.errorType : 'translator_failure',
+		};
+	}
+	const picked = (items || []).map((it) => {
+		const out = {
+			title: it.title,
+			itemType: it.itemType,
+			creators: it.creators,
+			DOI: it.DOI,
+			url: it.url,
+		};
+		if (it.key) out.key = it.key;
+		if (it.ISBN) out.ISBN = it.ISBN;
+		if (it.publicationTitle) out.publicationTitle = it.publicationTitle;
+		if (it.date) out.date = it.date;
+		if (it.abstractNote) out.abstractNote = it.abstractNote;
+		if (it.tags) out.tags = it.tags;
+		if (it.attachments) out.attachments = it.attachments.map(a => ({
+			title: a.title, mimeType: a.mimeType, url: a.url,
+		}));
+		return out;
+	});
+	return { success: true, items: picked, error: null, errorType: null };
+}
+
 let PageSaving = {
 	sessionDetails: {},
 	translators: [],
-	
+
+	// When true (Claude Bridge automation), suppress progressWindow UI and skip
+	// the interactive itemSelector — multi-item translators select all candidates.
+	_silent: false,
+
 	/**
 	 * @param itemType
 	 * @returns {Promise<Zotero.Translate.Web>}
@@ -197,6 +236,13 @@ let PageSaving = {
 		
 		// Translate handlers
 		const onSelect = (obj, items, callback) => {
+			// Silent mode (Claude Bridge): accept all candidates without
+			// opening the itemSelector dialog, which would otherwise block
+			// automation waiting for user interaction.
+			if (this._silent) {
+				callback(items);
+				return;
+			}
 			// Close the progress window before displaying Select Items
 			Zotero.Messaging.sendMessage("progressWindow.close", null);
 
@@ -530,87 +576,100 @@ let PageSaving = {
 	 * with selection as a note.
 	 */
 	async onTranslate(translatorID, options={}) {
-		let result = await Zotero.Inject.checkActionToServer();
-		if (!result) return;
-		let translatorIndex = this.translators.findIndex(t => t.translatorID === translatorID);
-		let translator = this.translators[translatorIndex];
-		Zotero.debug(`PageSaving.onTranslate: Translating with ${translator.label}, ${JSON.stringify(options)}`);
-		
-		// Always resave if a different translator/mode
-		if (this.sessionDetails.translatorID && translatorID != this.sessionDetails.translatorID) {
-			options.resave = true;
-		}
-		
-		// In some cases, we just reopen the popup instead of saving again
-		if (this._shouldReopenProgressWindow(translatorID, options, translator.itemType)) {
-			Zotero.debug(`PageSaving.onTranslate: Reopening popup`);
-			return Zotero.Messaging.sendMessage("progressWindow.show", [this.sessionDetails.id]);
-		}
-
-		// Each save on multiple should be a new session (do not reopen the popup)
-		if (translator.itemType === 'multiple' && this.sessionDetails.id && !options.resave) {
-			options.resave = true;
-		}
-
-		const sessionID = this._initSession(translatorID, options);
-
-		// If we're likely to show the Select Items window, delay the opening of the
-		// popup until we've had a chance to hide it (which happens in the 'select'
-		// callback in progressWindow_inject.js).
-		let delay = translator.itemType == 'multiple' ? 100 : 0;
-		let sendShowMessage = () => {
-			Zotero.Messaging.sendMessage(
-				"progressWindow.show",
-				[
-					sessionID,
-					null,
-					false,
-				]
-			);
-		}
-		// If tab is not focused (e.g. when saving multiple), setTimeout with 0 delay actually waits for
-		// a long time, probably due to how non-focused tabs are deprioritized in the event loop and causes
-		// the progress window to not be displayed/updated properly
-		if (delay) {
-			setTimeout(sendShowMessage, delay)
-		}
-		else {
-			sendShowMessage();
-		}
-		
+		const silent = !!options.silent;
+		this._silent = silent;
 		try {
-			let translators = this.translators.slice(translatorIndex);
-			// If no fallback on failure, only provide the selected translator
-			if (!options.fallbackOnFailure) {
-				translators = translators.slice(0, 1)
+			if (!silent) {
+				let result = await Zotero.Inject.checkActionToServer();
+				if (!result) return;
 			}
-			let items = await this.translateAndSave(translators, options.fallbackOnFailure);
-			Zotero.Messaging.sendMessage("progressWindow.done", [true]);
-			return items;
-		} catch (e) {
-			Zotero.logError(e);
-			// Clear session details on failure, so another save click tries again
-			this._clearSession();
-			// We delay opening the progressWindow for multiple items so we don't have to flash it
-			// for the select dialog. But it comes back to bite us in the butt if a translation
-			// error occurs immediately since the below command will execute before the progressWindow show,
-			// and then the delayed progressWindow.show will pop up another empty progress window.
-			// Cannot have that!
-			await Zotero.Promise.delay(500);
-			const isAccessLimitingTranslator = SITE_ACCESS_LIMIT_TRANSLATORS.has(translator.translatorID);
-			const errorMessage = e.toString();
-			let statusCode = '';
-			try {
-				statusCode = errorMessage.match(/status code ([0-9]{3})/)[1];
-			} catch (e) {}
-			const isHTTPErrorForbidden = statusCode == '403';
-			const isHTTPErrorTooManyRequests = statusCode == '429';
-			if ((isAccessLimitingTranslator && isHTTPErrorForbidden) || isHTTPErrorTooManyRequests) {
-				Zotero.Messaging.sendMessage("progressWindow.done", [false, 'siteAccessLimits', translator.label]);
+			let translatorIndex = this.translators.findIndex(t => t.translatorID === translatorID);
+			let translator = this.translators[translatorIndex];
+			Zotero.debug(`PageSaving.onTranslate: Translating with ${translator.label}, ${JSON.stringify(options)}`);
+
+			// Always resave if a different translator/mode
+			if (this.sessionDetails.translatorID && translatorID != this.sessionDetails.translatorID) {
+				options.resave = true;
+			}
+
+			// In some cases, we just reopen the popup instead of saving again
+			if (this._shouldReopenProgressWindow(translatorID, options, translator.itemType)) {
+				Zotero.debug(`PageSaving.onTranslate: Reopening popup`);
+				if (!silent) return Zotero.Messaging.sendMessage("progressWindow.show", [this.sessionDetails.id]);
+				return _formatCaptureResult(this.sessionDetails.items || []);
+			}
+
+			// Each save on multiple should be a new session (do not reopen the popup)
+			if (translator.itemType === 'multiple' && this.sessionDetails.id && !options.resave) {
+				options.resave = true;
+			}
+
+			const sessionID = this._initSession(translatorID, options);
+
+			// If we're likely to show the Select Items window, delay the opening of the
+			// popup until we've had a chance to hide it (which happens in the 'select'
+			// callback in progressWindow_inject.js).
+			let delay = translator.itemType == 'multiple' ? 100 : 0;
+			let sendShowMessage = () => {
+				if (silent) return;
+				Zotero.Messaging.sendMessage(
+					"progressWindow.show",
+					[
+						sessionID,
+						null,
+						false,
+					]
+				);
+			}
+			// If tab is not focused (e.g. when saving multiple), setTimeout with 0 delay actually waits for
+			// a long time, probably due to how non-focused tabs are deprioritized in the event loop and causes
+			// the progress window to not be displayed/updated properly
+			if (delay) {
+				setTimeout(sendShowMessage, delay)
 			}
 			else {
-				Zotero.Messaging.sendMessage("progressWindow.done", [false]);
+				sendShowMessage();
 			}
+
+			try {
+				let translators = this.translators.slice(translatorIndex);
+				// If no fallback on failure, only provide the selected translator
+				if (!options.fallbackOnFailure) {
+					translators = translators.slice(0, 1)
+				}
+				let items = await this.translateAndSave(translators, options.fallbackOnFailure);
+				if (!silent) Zotero.Messaging.sendMessage("progressWindow.done", [true]);
+				return silent ? _formatCaptureResult(items) : items;
+			} catch (e) {
+				Zotero.logError(e);
+				// Clear session details on failure, so another save click tries again
+				this._clearSession();
+				if (silent) {
+					return _formatCaptureResult(null, e);
+				}
+				// We delay opening the progressWindow for multiple items so we don't have to flash it
+				// for the select dialog. But it comes back to bite us in the butt if a translation
+				// error occurs immediately since the below command will execute before the progressWindow show,
+				// and then the delayed progressWindow.show will pop up another empty progress window.
+				// Cannot have that!
+				await Zotero.Promise.delay(500);
+				const isAccessLimitingTranslator = SITE_ACCESS_LIMIT_TRANSLATORS.has(translator.translatorID);
+				const errorMessage = e.toString();
+				let statusCode = '';
+				try {
+					statusCode = errorMessage.match(/status code ([0-9]{3})/)[1];
+				} catch (e) {}
+				const isHTTPErrorForbidden = statusCode == '403';
+				const isHTTPErrorTooManyRequests = statusCode == '429';
+				if ((isAccessLimitingTranslator && isHTTPErrorForbidden) || isHTTPErrorTooManyRequests) {
+					Zotero.Messaging.sendMessage("progressWindow.done", [false, 'siteAccessLimits', translator.label]);
+				}
+				else {
+					Zotero.Messaging.sendMessage("progressWindow.done", [false]);
+				}
+			}
+		} finally {
+			this._silent = false;
 		}
 	},
 

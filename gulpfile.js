@@ -164,6 +164,7 @@ var backgroundIncludeBrowserExt = ['browser-polyfill.js'].concat(backgroundInclu
 	'messagingGeneric.js',
 	'browserAttachmentMonitor/browserAttachmentMonitor.js',
 	'offscreen/offscreenFunctionOverrides.js', 'background/offscreenManager.js',
+	'claude-bridge.js',
 ]);
 
 function reloadChromeExtensionsTab(cb) {
