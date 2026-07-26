@@ -83,7 +83,16 @@ function _formatCaptureResult(items, error=null) {
 		}));
 		return out;
 	});
-	return { success: true, items: picked, error: null, errorType: null };
+	const result = { success: true, items: picked, error: null, errorType: null };
+	// PDF/primary attachment status gathered silently via _onAttachmentProgress.
+	if (PageSaving._silentPdfFailed) {
+		result.pdf_status = 'failed';
+		result.pdf_error = PageSaving._silentPdfError;
+	}
+	else {
+		result.pdf_status = 'ok';
+	}
+	return result;
 }
 
 let PageSaving = {
@@ -93,6 +102,11 @@ let PageSaving = {
 	// When true (Claude Bridge automation), suppress progressWindow UI and skip
 	// the interactive itemSelector — multi-item translators select all candidates.
 	_silent: false,
+
+	// Silent-mode PDF/primary attachment failure tracking (populated by
+	// _onAttachmentProgress, reported via _formatCaptureResult).
+	_silentPdfFailed: false,
+	_silentPdfError: null,
 
 	/**
 	 * @param itemType
@@ -209,6 +223,16 @@ let PageSaving = {
 	},
 	
 	_onAttachmentProgress(attachment, progress) {
+		if (this._silent) {
+			// Silent (Claude Bridge): track PDF/primary attachment download
+			// failure. progress === false means the itemSaver reported a failure.
+			if (progress === false && attachment
+					&& (attachment.mimeType === 'application/pdf' || attachment.isPrimary)) {
+				this._silentPdfFailed = true;
+				this._silentPdfError = (arguments[2]) ? String(arguments[2]) : 'download failed';
+			}
+			return;
+		}
 		const sessionID = PageSaving.sessionDetails.id;
 		Zotero.Messaging.sendMessage(
 			"progressWindow.itemProgress",
@@ -578,6 +602,10 @@ let PageSaving = {
 	async onTranslate(translatorID, options={}) {
 		const silent = !!options.silent;
 		this._silent = silent;
+		if (silent) {
+			this._silentPdfFailed = false;
+			this._silentPdfError = null;
+		}
 		try {
 			if (!silent) {
 				let result = await Zotero.Inject.checkActionToServer();

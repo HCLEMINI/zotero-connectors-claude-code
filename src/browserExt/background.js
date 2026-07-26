@@ -1236,7 +1236,11 @@ Zotero.Connector_Browser = new function() {
 	};
 
 	// Claude Bridge: open a URL in a background tab, wait for load + translator
-	// detection, then capture it via captureActiveTab. Closes the tab afterwards.
+	// detection, then capture it via captureActiveTab.
+	// On SUCCESS: close the tab (unless options.closeAfter === false).
+	// On FAILURE (no_translator / capture failure / timeout / exception): keep
+	// the tab AND activate it, returning need_verification:true so the user can
+	// complete human verification and retry with capture_active_tab.
 	this.captureUrl = async function(url, options={}) {
 		const closeAfter = options.closeAfter !== false;
 		const loadTimeoutMs = options.loadTimeoutMs || 30000;
@@ -1258,26 +1262,43 @@ Zotero.Connector_Browser = new function() {
 			await _waitForTabStatus(tabId, 'complete', loadTimeoutMs);
 			const tabInfo = await _waitForTranslators(tabId, detectTimeoutMs);
 			if (!tabInfo.translators || !tabInfo.translators.length) {
+				await _activateTab(tabId);
 				return {
 					success: false,
 					errorType: 'no_translator',
 					error: `No translator detected for ${url}`,
-					url, items: []
+					url, items: [],
+					need_verification: true,
+					opened_tab_url: url,
+					hint: 'Opened the page in the browser. If it is a security-verification / login page, complete the check, then ask Claude to capture_active_tab on that tab.'
 				};
 			}
 			const result = await Zotero.Connector_Browser.captureActiveTab(tabId);
+			if (result && result.success === false) {
+				await _activateTab(tabId);
+				result.need_verification = true;
+				result.opened_tab_url = url;
+				result.hint = 'Capture failed. The page is open in the browser — check it (human verification may be required), then ask Claude to capture_active_tab on that tab.';
+				return result;
+			}
+			if (closeAfter) {
+				try { await browser.tabs.remove(tabId); } catch (e) {}
+			}
 			if (result && url) result.url = result.url || url;
 			return result;
 		}
 		catch (e) {
 			const msg = (e && e.message) || String(e);
 			const errorType = /timeout/i.test(msg) ? 'timeout' : 'unknown';
-			return { success: false, errorType, error: msg, url, items: [] };
+			if (tabId !== undefined) await _activateTab(tabId);
+			return {
+				success: false, errorType, error: msg, url, items: [],
+				need_verification: true,
+				opened_tab_url: url,
+				hint: 'Timed out or errored while opening the page. It is now open in the browser — check it, then ask Claude to capture_active_tab on that tab.'
+			};
 		}
 		finally {
-			if (closeAfter && tabId !== undefined) {
-				try { await browser.tabs.remove(tabId); } catch (e) {}
-			}
 			Zotero.Connector_Browser.setKeepServiceWorkerAlive(false);
 		}
 	};
@@ -1332,6 +1353,13 @@ Zotero.Connector_Browser = new function() {
 	// Claude Bridge helpers: wait for a tab to reach a given status, and wait
 	// for translator detection to populate tabInfo.translators. Both poll on a
 	// short interval and reject with 'timeout' / 'No tab' on failure.
+
+	// Claude Bridge: bring a tab to the foreground. Used when captureUrl fails
+	// so the user can see / complete human verification on the opened page.
+	async function _activateTab(tabId) {
+		try { await browser.tabs.update(tabId, { active: true }); } catch (e) {}
+	}
+
 	async function _waitForTabStatus(tabId, targetStatus, timeoutMs) {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
