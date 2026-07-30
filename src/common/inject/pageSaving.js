@@ -222,6 +222,20 @@ let PageSaving = {
 		return items;
 	},
 	
+	_cleanItemTitles(items) {
+		// CNKI (知网) 在论文标题末尾混入"附视频"等页面标记,translator 原样抓取了。
+		// 剥离这些已知的知网后缀标记(仅匹配标题末尾;其他站点标题不会含此中文后缀)。
+		// 如发现新的知网后缀标记,在此扩展正则即可。
+		const CNKI_SUFFIX_RE = /(附视频)$/;
+		for (let item of items) {
+			if (item && item.title && CNKI_SUFFIX_RE.test(item.title)) {
+				Zotero.debug(`PageSaving._cleanItemTitles: stripping CNKI suffix from "${item.title}"`);
+				item.title = item.title.replace(CNKI_SUFFIX_RE, '').trim();
+			}
+		}
+		return items;
+	},
+
 	_onAttachmentProgress(attachment, progress) {
 		if (this._silent) {
 			// Silent (Claude Bridge): track PDF/primary attachment download
@@ -361,6 +375,7 @@ let PageSaving = {
 			if (proxy) proxy = new Zotero.Proxy(proxy);
 		}
 		items = this._processNote(items);
+		items = this._cleanItemTitles(items);
 		this.sessionDetails.items = items;
 		let itemType = translators[0].itemType;
 		let itemSaver = new Zotero.ItemSaver({ sessionID, itemType, baseURI: document.location.href, proxy });
