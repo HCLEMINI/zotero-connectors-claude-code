@@ -2,6 +2,24 @@
 
 [![Build Status](https://travis-ci.org/zotero/zotero-connectors.svg?branch=master)](https://travis-ci.org/zotero/zotero-connectors)
 
+## Fork: Claude-driven capture (for the `zotero-capture` skill)
+
+This is a fork of `zotero/zotero-connectors` that makes the connector **programmatically drivable**, so [Claude Code](https://claude.com/claude-code) can capture web papers into the local Zotero client automatically. It is driven by a local Claude Code skill called **`zotero-capture`** — there is **no MCP server** (the earlier `zotero-claude-bridge` MCP layer was retired; its WS engine lives inside the skill now).
+
+**Architecture**: the skill's Python script starts a WebSocket server on `ws://127.0.0.1:24731/bridge`; this extension's `src/browserExt/claude-bridge.js` connects to it as a client and drives the existing translator + itemSaver pipeline → local Zotero (`127.0.0.1:23119`).
+
+**Changes vs upstream**:
+- `src/browserExt/claude-bridge.js` (new): WS client — auth, heartbeat, exponential-backoff reconnect; dispatches `capture_active_tab` / `capture_url` / `capture_urls`.
+- `src/browserExt/background.js`:
+  - `Zotero.Connector_Browser.captureActiveTab` / `captureUrl` — programmatic capture (silent mode, returns a structured CaptureResult).
+  - **Cloudflare / interstitial fix**: `_waitForTabStatus` now waits for the page to FULLY stop loading (`complete` + non-interstitial title + stable for `stableMs`), not the first `complete`; `captureActiveTab` retries every 15s on empty items until the real page appears; tabs open in the foreground (`tabActive`) so CF challenges can complete; a tab is closed only if items were actually captured.
+- `src/common/inject/pageSaving.js`: `silent` flag (auto-select all on multi-item, no progressWindow), structured CaptureResult, strips the CNKI `附视频` title suffix.
+- `gulpfile.js`: packages `claude-bridge.js` into the MV3 background worker.
+
+**Build note (Windows, no WSL)**: the Chinese+bracket path `【code】\` breaks `build.sh`'s rsync/perl/jq — keep a pure-ASCII clone of this repo for building and run `bash build.sh -d` there; load `build/manifestv3/` in Chrome/Edge.
+
+See the `zotero-capture` skill's `SKILL.md` for the capture workflow, throttling/PDF-verification, and the CNKI/Cloudflare lessons learned.
+
 ## Building
 
 1. `git clone https://github.com/zotero/zotero-connectors.git`

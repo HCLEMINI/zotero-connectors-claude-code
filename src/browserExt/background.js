@@ -1257,9 +1257,20 @@ Zotero.Connector_Browser = new function() {
 		Zotero.Connector_Browser.setKeepServiceWorkerAlive(true);
 		let tabId;
 		try {
-			const tab = await browser.tabs.create({ url, active: false });
+			// CF-protected publishers: open in the FOREGROUND (active) so the
+			// Cloudflare challenge can actually complete (background tabs often
+			// stall on the interstitial), and wait for the page to FULLY stop
+			// loading (complete + non-interstitial title + stable) — not the
+			// first 'complete' — before detecting translators.
+			const tabActive = options.tabActive !== false;
+			const tab = await browser.tabs.create({ url, active: tabActive });
 			tabId = tab.id;
-			await _waitForTabStatus(tabId, 'complete', loadTimeoutMs);
+			await _waitForTabStatus(tabId, 'complete', loadTimeoutMs, {
+				stableMs: options.stableMs != null ? options.stableMs : 4000,
+				titleBlocklist: ['请稍候', 'just a moment', 'attention required',
+					'checking your browser', 'enable javascript', 'needs javascript',
+					'访问验证', '安全检查', 'one more step'],
+			});
 			const tabInfo = await _waitForTranslators(tabId, detectTimeoutMs);
 			if (!tabInfo.translators || !tabInfo.translators.length) {
 				await _activateTab(tabId);
@@ -1273,7 +1284,27 @@ Zotero.Connector_Browser = new function() {
 					hint: 'Opened the page in the browser. If it is a security-verification / login page, complete the check, then ask Claude to capture_active_tab on that tab.'
 				};
 			}
-			const result = await Zotero.Connector_Browser.captureActiveTab(tabId);
+			let result = await Zotero.Connector_Browser.captureActiveTab(tabId);
+			// CF / JS-heavy pages can report status 'complete' while the real
+			// content isn't rendered yet (interstitial still showing) → first
+			// capture returns empty items. Retry every 15s until items appear
+			// or time runs out. The real page WILL appear (user can see it
+			// open), so retries eventually catch it. Fixes the ACS/Wiley case
+			// where CF resolves slowly and the early capture grabbed nothing.
+			const captureDeadline = Date.now() + loadTimeoutMs;
+			let retries = 0;
+			while (result && result.success !== false
+				&& (!result.items || result.items.length === 0)
+				&& Date.now() < captureDeadline && retries < 10) {
+				await new Promise(r => setTimeout(r, 15000));
+				retries++;
+				try {
+					Zotero.debug('[captureUrl] empty items, retry ' + retries);
+					const r2 = await Zotero.Connector_Browser.captureActiveTab(tabId);
+					if (r2 && r2.items && r2.items.length) { result = r2; break; }
+					if (r2 && r2.success === false) { result = r2; break; }
+				} catch (e) {}
+			}
 			if (result && result.success === false) {
 				await _activateTab(tabId);
 				result.need_verification = true;
@@ -1281,7 +1312,8 @@ Zotero.Connector_Browser = new function() {
 				result.hint = 'Capture failed. The page is open in the browser — check it (human verification may be required), then ask Claude to capture_active_tab on that tab.';
 				return result;
 			}
-			if (closeAfter) {
+			// Only close the tab if we actually got items; keep it open otherwise.
+			if (closeAfter && result && result.items && result.items.length) {
 				try { await browser.tabs.remove(tabId); } catch (e) {}
 			}
 			if (result && url) result.url = result.url || url;
@@ -1360,12 +1392,30 @@ Zotero.Connector_Browser = new function() {
 		try { await browser.tabs.update(tabId, { active: true }); } catch (e) {}
 	}
 
-	async function _waitForTabStatus(tabId, targetStatus, timeoutMs) {
+	async function _waitForTabStatus(tabId, targetStatus, timeoutMs, opts) {
+		// Wait for the tab to FULLY finish loading — NOT the first 'complete'.
+		// Cloudflare / 防火墙审核 interstitial pages themselves report status
+		// 'complete' while still being a verification page (title 「请稍候…」/「Just
+		// a moment…」). Require: status===target AND title not an interstitial AND
+		// stable for stableMs (the CF pass-through redirect flips status back to
+		// 'loading', which resets the stable timer so we land on the REAL page).
+		opts = opts || {};
+		const stableMs = opts.stableMs || 0;
+		const blocklist = opts.titleBlocklist || [];
 		const deadline = Date.now() + timeoutMs;
+		let stableSince = 0;
 		while (Date.now() < deadline) {
 			try {
 				const tab = await browser.tabs.get(tabId);
-				if (tab.status === targetStatus) return tab;
+				const title = (tab.title || '').toLowerCase();
+				const blocked = blocklist.some(k => title.includes(k));
+				if (tab.status === targetStatus && !blocked) {
+					if (!stableSince) stableSince = Date.now();
+					if (Date.now() - stableSince >= stableMs) return tab;
+				}
+				else {
+					stableSince = 0; // still loading or on an interstitial — keep waiting
+				}
 			}
 			catch (e) {
 				throw new Error('No tab with id: ' + tabId);
