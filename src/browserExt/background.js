@@ -1273,7 +1273,6 @@ Zotero.Connector_Browser = new function() {
 			});
 			const tabInfo = await _waitForTranslators(tabId, detectTimeoutMs);
 			if (!tabInfo.translators || !tabInfo.translators.length) {
-				await _activateTab(tabId);
 				return {
 					success: false,
 					errorType: 'no_translator',
@@ -1281,7 +1280,7 @@ Zotero.Connector_Browser = new function() {
 					url, items: [],
 					need_verification: true,
 					opened_tab_url: url,
-					hint: 'Opened the page in the browser. If it is a security-verification / login page, complete the check, then ask Claude to capture_active_tab on that tab.'
+					hint: 'No translator for this page (tab will be closed). If it needs login/verification, reopen opened_tab_url, complete it, then capture_active_tab.'
 				};
 			}
 			let result = await Zotero.Connector_Browser.captureActiveTab(tabId);
@@ -1306,31 +1305,32 @@ Zotero.Connector_Browser = new function() {
 				} catch (e) {}
 			}
 			if (result && result.success === false) {
-				await _activateTab(tabId);
 				result.need_verification = true;
 				result.opened_tab_url = url;
-				result.hint = 'Capture failed. The page is open in the browser — check it (human verification may be required), then ask Claude to capture_active_tab on that tab.';
+				result.hint = 'Capture failed (tab will be closed). To retry: reopen opened_tab_url, complete any verification, then capture_active_tab.';
 				return result;
 			}
-			// Only close the tab if we actually got items; keep it open otherwise.
-			if (closeAfter && result && result.items && result.items.length) {
-				try { await browser.tabs.remove(tabId); } catch (e) {}
-			}
+			// Tab is closed in the finally block (success or failure).
 			if (result && url) result.url = result.url || url;
 			return result;
 		}
 		catch (e) {
 			const msg = (e && e.message) || String(e);
 			const errorType = /timeout/i.test(msg) ? 'timeout' : 'unknown';
-			if (tabId !== undefined) await _activateTab(tabId);
 			return {
 				success: false, errorType, error: msg, url, items: [],
 				need_verification: true,
 				opened_tab_url: url,
-				hint: 'Timed out or errored while opening the page. It is now open in the browser — check it, then ask Claude to capture_active_tab on that tab.'
+				hint: 'Timed out or errored (tab will be closed). To retry: reopen opened_tab_url, then capture_active_tab.'
 			};
 		}
 		finally {
+			// Close the tab regardless of success/failure (closeAfter default true).
+			// Previously failures kept the tab open for re-capture, but that piles up
+			// tabs in batch runs; callers can reopen via opened_tab_url if needed.
+			if (closeAfter && tabId !== undefined) {
+				try { await browser.tabs.remove(tabId); } catch (e) {}
+			}
 			Zotero.Connector_Browser.setKeepServiceWorkerAlive(false);
 		}
 	};
